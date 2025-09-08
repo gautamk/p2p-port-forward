@@ -10,6 +10,9 @@ Tested with ProtonVPN and `linuxserver/qbittorrent`, but should work with other 
 - Automatically maps rotating VPN P2P ports to your torrent client's listening port
 - Uses NAT-PMP (with `natpmpc`) to request forwarded ports from your VPN provider
 - Installs `libnatpmp` inside your container if missing
+- **Enhanced reliability** with retry logic for installation and port mapping failures
+- **Automatic diagnostics** to help troubleshoot connectivity and configuration issues
+- **Better error handling** with detailed logging for troubleshooting
 - Minimal configuration required
 
 ---
@@ -82,3 +85,97 @@ Tested with ProtonVPN and `linuxserver/qbittorrent`, but should work with other 
     ```
 
 4. Within 5 minutes, your torrent client should acknowledge a fully connected client.  For example, qBittorrent will show an orange flame at the bottom for a firewalled connection. This should change to a green globe after the script runs successfully and the client updates.
+
+---
+
+## Troubleshooting
+
+If your torrent client still shows as "Firewalled" despite successful port mapping, try these steps:
+
+### Common Issues and Solutions
+
+#### 1. Script shows successful mapping but client still firewalled
+
+**Check the log for diagnostic information:**
+```bash
+tail -f /var/log/natpmp_forward.log
+```
+
+Look for diagnostic messages that appear periodically. The script automatically runs diagnostics every ~15 cycles to help identify issues:
+- Network connectivity to WireGuard gateway
+- External DNS resolution
+- qBittorrent listening port validation
+
+#### 2. libnatpmp installation failures
+
+The script now includes retry logic for `libnatpmp` installation. If you see repeated installation failures:
+
+1. Check if your container has internet access
+2. Verify the container is using an Alpine-based image (required for `apk` package manager)
+3. Try restarting the container and script
+
+#### 3. Network connectivity issues
+
+**Verify WireGuard tunnel is working:**
+```bash
+# Test from within your torrent container
+docker exec qbittorrent ping -c 3 10.2.0.1
+
+# Check container network configuration
+docker exec qbittorrent ip addr show
+```
+
+#### 4. Port configuration mismatch
+
+**Verify qBittorrent settings:**
+1. In qBittorrent WebUI, go to **Settings > Connection**
+2. Ensure "Use UPnP / NAT-PMP port forwarding from my router" is **DISABLED**
+3. Verify the listening port matches your script's `LISTENING_PORT` value (default: 6881)
+4. Check that qBittorrent is actually listening on the configured port
+
+#### 5. VPN server issues
+
+**Try a different ProtonVPN server:**
+1. Some P2P servers may have temporary issues
+2. Switch to a different P2P-enabled server (e.g., Switzerland #920)
+3. Ensure NAT-PMP is enabled in your ProtonVPN config
+
+#### 6. Container restart issues
+
+If the script stops working after a container restart:
+1. The enhanced script now automatically reinstalls `libnatpmp` if needed
+2. Check the logs for "natpmpc no longer available, reinstalling..." messages
+3. Allow a few cycles for the script to recover
+
+### Advanced Troubleshooting
+
+#### Manual NAT-PMP Test
+
+Test NAT-PMP manually from within your container:
+```bash
+docker exec qbittorrent natpmpc -a 0 6881 udp 1200 -g 10.2.0.1
+```
+
+Expected output should include:
+```
+Mapped public port XXXXX to internal port 6881
+```
+
+#### Check Script Configuration
+
+Verify your script variables match your setup:
+- `CONTAINER`: Exact name of your torrent container
+- `LISTENING_PORT`: Should match qBittorrent's listening port
+- `WGTUNNEL`: Should be your WireGuard gateway (typically ends in .1)
+
+#### Container Network Debugging
+
+```bash
+# Check container is using VPN network
+docker inspect qbittorrent | grep NetworkMode
+
+# Verify container IP is in VPN range
+docker exec qbittorrent ip route show
+```
+
+If none of these steps resolve the issue, check the detailed diagnostic logs that the script now generates automatically.
