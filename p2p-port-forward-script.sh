@@ -13,7 +13,22 @@ mkdir -p "$(dirname "$LOGFILE")"
 
 # Function to run diagnostics
 run_diagnostics() {
+    local current_public_ip=""
+    local current_mapped_port=""
+    
     echo "=== DIAGNOSTIC INFORMATION ===" | tee -a "$LOGFILE"
+    
+    # Get current public IP and mapped port from natpmpc
+    echo "Getting current VPN public IP and port mapping..." | tee -a "$LOGFILE"
+    local natpmpc_output
+    if natpmpc_output=$(docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" udp 3600 -g "$WGTUNNEL" 2>&1); then
+        current_public_ip=$(echo "$natpmpc_output" | grep -oP 'Public IP address : \K[0-9.]+' | tail -n1)
+        current_mapped_port=$(echo "$natpmpc_output" | grep -oP 'Mapped public port \K[0-9]+' | tail -n1)
+        echo "✓ Public IP: $current_public_ip, Mapped Port: $current_mapped_port" | tee -a "$LOGFILE"
+    else
+        echo "✗ Failed to get current public IP and port mapping" | tee -a "$LOGFILE"
+    fi
+    echo "" | tee -a "$LOGFILE"
     
     # Check container network configuration
     echo "Container network info:" | tee -a "$LOGFILE"
@@ -38,6 +53,37 @@ run_diagnostics() {
     fi
     echo "" | tee -a "$LOGFILE"
     
+    # Test external port connectivity (if we have current mapping info)
+    if [[ -n "$current_public_ip" && -n "$current_mapped_port" ]]; then
+        echo "Testing external port connectivity ($current_public_ip:$current_mapped_port):" | tee -a "$LOGFILE"
+        # Try to test the port from within the container using timeout and nc/telnet
+        if docker exec "$CONTAINER" sh -c "command -v nc >/dev/null 2>&1"; then
+            # Use netcat to test external connectivity
+            if timeout 10 docker exec "$CONTAINER" sh -c "echo '' | nc -w 5 $current_public_ip $current_mapped_port" 2>/dev/null; then
+                echo "✓ External port $current_public_ip:$current_mapped_port is reachable" | tee -a "$LOGFILE"
+            else
+                echo "✗ External port $current_public_ip:$current_mapped_port is NOT reachable from container" | tee -a "$LOGFILE"
+                echo "  This suggests the VPN provider's port forwarding may not be working properly" | tee -a "$LOGFILE"
+            fi
+        else
+            # Try with curl as an alternative
+            if docker exec "$CONTAINER" sh -c "command -v curl >/dev/null 2>&1"; then
+                if timeout 10 docker exec "$CONTAINER" curl -m 5 --connect-timeout 5 "telnet://$current_public_ip:$current_mapped_port" 2>&1 | grep -q "Connected"; then
+                    echo "✓ External port $current_public_ip:$current_mapped_port is reachable" | tee -a "$LOGFILE"
+                else
+                    echo "✗ External port $current_public_ip:$current_mapped_port is NOT reachable from container" | tee -a "$LOGFILE"
+                    echo "  This suggests the VPN provider's port forwarding may not be working properly" | tee -a "$LOGFILE"
+                fi
+            else
+                echo "⚠ Cannot test external port connectivity (nc/curl not available in container)" | tee -a "$LOGFILE"
+                echo "  Consider installing netcat-openbsd or curl in your container for better diagnostics" | tee -a "$LOGFILE"
+            fi
+        fi
+    else
+        echo "⚠ Cannot test external port connectivity (no current mapping info available)" | tee -a "$LOGFILE"
+    fi
+    echo "" | tee -a "$LOGFILE"
+    
     # Check if qBittorrent is listening on the configured port
     echo "Checking if qBittorrent is listening on port $LISTENING_PORT:" | tee -a "$LOGFILE"
     if docker exec "$CONTAINER" netstat -ln 2>/dev/null | grep ":$LISTENING_PORT " | tee -a "$LOGFILE" >/dev/null; then
@@ -48,6 +94,16 @@ run_diagnostics() {
         docker exec "$CONTAINER" netstat -ln 2>/dev/null | grep LISTEN | tee -a "$LOGFILE" || echo "netstat not available" | tee -a "$LOGFILE"
     fi
     echo "" | tee -a "$LOGFILE"
+    
+    # ProtonVPN specific recommendations
+    if [[ -n "$current_public_ip" && -n "$current_mapped_port" ]]; then
+        echo "ProtonVPN troubleshooting recommendations:" | tee -a "$LOGFILE"
+        echo "1. Verify you're connected to a P2P-enabled ProtonVPN server" | tee -a "$LOGFILE"
+        echo "2. Test external connectivity using: Test-NetConnection -ComputerName $current_public_ip -Port $current_mapped_port" | tee -a "$LOGFILE"
+        echo "3. Some ProtonVPN P2P servers may have port forwarding limitations" | tee -a "$LOGFILE"
+        echo "4. Try connecting to a different ProtonVPN P2P server if external connectivity fails" | tee -a "$LOGFILE"
+        echo "" | tee -a "$LOGFILE"
+    fi
     
     echo "=== END DIAGNOSTICS ===" | tee -a "$LOGFILE"
     echo "" | tee -a "$LOGFILE"
@@ -144,7 +200,7 @@ while true; do
             echo "Running natpmpc for $protocol (attempt $((retry_count + 1))/$max_retries)..." >> "$LOGFILE"
             
             local output
-            output=$(docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" "$protocol" 1200 -g "$WGTUNNEL" 2>&1)
+            output=$(docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" "$protocol" 3600 -g "$WGTUNNEL" 2>&1)
             local exit_code=$?
             
             echo "$protocol Mapping Output:" >> "$LOGFILE"
