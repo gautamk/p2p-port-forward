@@ -13,44 +13,44 @@ mkdir -p "$(dirname "$LOGFILE")"
 
 # Function to run diagnostics
 run_diagnostics() {
-    echo "=== DIAGNOSTIC INFORMATION ===" >> "$LOGFILE"
+    echo "=== DIAGNOSTIC INFORMATION ===" | tee -a "$LOGFILE"
     
     # Check container network configuration
-    echo "Container network info:" >> "$LOGFILE"
-    docker exec "$CONTAINER" ip addr show 2>/dev/null >> "$LOGFILE" || echo "Failed to get container IP info" >> "$LOGFILE"
-    echo "" >> "$LOGFILE"
+    echo "Container network info:" | tee -a "$LOGFILE"
+    docker exec "$CONTAINER" ip addr show 2>/dev/null | tee -a "$LOGFILE" || echo "Failed to get container IP info" | tee -a "$LOGFILE"
+    echo "" | tee -a "$LOGFILE"
     
     # Test connectivity to WireGuard gateway
-    echo "Testing connectivity to WireGuard gateway ($WGTUNNEL):" >> "$LOGFILE"
-    if docker exec "$CONTAINER" ping -c 3 "$WGTUNNEL" 2>&1 >> "$LOGFILE"; then
-        echo "✓ WireGuard gateway is reachable" >> "$LOGFILE"
+    echo "Testing connectivity to WireGuard gateway ($WGTUNNEL):" | tee -a "$LOGFILE"
+    if docker exec "$CONTAINER" ping -c 3 "$WGTUNNEL" 2>&1 | tee -a "$LOGFILE" >/dev/null; then
+        echo "✓ WireGuard gateway is reachable" | tee -a "$LOGFILE"
     else
-        echo "✗ WireGuard gateway is NOT reachable" >> "$LOGFILE"
+        echo "✗ WireGuard gateway is NOT reachable" | tee -a "$LOGFILE"
     fi
-    echo "" >> "$LOGFILE"
+    echo "" | tee -a "$LOGFILE"
     
     # Test external connectivity
-    echo "Testing external connectivity:" >> "$LOGFILE"
-    if docker exec "$CONTAINER" nslookup google.com 2>&1 >> "$LOGFILE"; then
-        echo "✓ External DNS resolution works" >> "$LOGFILE"
+    echo "Testing external connectivity:" | tee -a "$LOGFILE"
+    if docker exec "$CONTAINER" nslookup google.com 2>&1 | tee -a "$LOGFILE" >/dev/null; then
+        echo "✓ External DNS resolution works" | tee -a "$LOGFILE"
     else
-        echo "✗ External DNS resolution failed" >> "$LOGFILE"
+        echo "✗ External DNS resolution failed" | tee -a "$LOGFILE"
     fi
-    echo "" >> "$LOGFILE"
+    echo "" | tee -a "$LOGFILE"
     
     # Check if qBittorrent is listening on the configured port
-    echo "Checking if qBittorrent is listening on port $LISTENING_PORT:" >> "$LOGFILE"
-    if docker exec "$CONTAINER" netstat -ln 2>/dev/null | grep ":$LISTENING_PORT " >> "$LOGFILE"; then
-        echo "✓ qBittorrent is listening on port $LISTENING_PORT" >> "$LOGFILE"
+    echo "Checking if qBittorrent is listening on port $LISTENING_PORT:" | tee -a "$LOGFILE"
+    if docker exec "$CONTAINER" netstat -ln 2>/dev/null | grep ":$LISTENING_PORT " | tee -a "$LOGFILE" >/dev/null; then
+        echo "✓ qBittorrent is listening on port $LISTENING_PORT" | tee -a "$LOGFILE"
     else
-        echo "✗ qBittorrent is NOT listening on port $LISTENING_PORT" >> "$LOGFILE"
-        echo "Available listening ports in container:" >> "$LOGFILE"
-        docker exec "$CONTAINER" netstat -ln 2>/dev/null | grep LISTEN >> "$LOGFILE" || echo "netstat not available" >> "$LOGFILE"
+        echo "✗ qBittorrent is NOT listening on port $LISTENING_PORT" | tee -a "$LOGFILE"
+        echo "Available listening ports in container:" | tee -a "$LOGFILE"
+        docker exec "$CONTAINER" netstat -ln 2>/dev/null | grep LISTEN | tee -a "$LOGFILE" || echo "netstat not available" | tee -a "$LOGFILE"
     fi
-    echo "" >> "$LOGFILE"
+    echo "" | tee -a "$LOGFILE"
     
-    echo "=== END DIAGNOSTICS ===" >> "$LOGFILE"
-    echo "" >> "$LOGFILE"
+    echo "=== END DIAGNOSTICS ===" | tee -a "$LOGFILE"
+    echo "" | tee -a "$LOGFILE"
 }
 
 # Wait for container to initialize
@@ -129,12 +129,10 @@ while true; do
         fi
     fi
 
-    # Run diagnostics every few cycles (every 10 minutes with default 45s interval)
+    # Initialize diagnostic tracking variables
     CYCLE_COUNT=${CYCLE_COUNT:-0}
+    FIRST_SUCCESS_DIAGNOSTICS_RUN=${FIRST_SUCCESS_DIAGNOSTICS_RUN:-false}
     CYCLE_COUNT=$((CYCLE_COUNT + 1))
-    if (( CYCLE_COUNT % 15 == 1 )); then  # Run diagnostics every 15 cycles
-        run_diagnostics
-    fi
 
     # Function to run natpmpc with retry logic
     run_natpmpc_with_retry() {
@@ -209,7 +207,7 @@ while true; do
         echo "TCP Success: $TCP_SUCCESS, UDP Success: $UDP_SUCCESS" >> "$LOGFILE"
         
         # Run diagnostics on failure to help troubleshooting
-        echo "Running diagnostics due to port mapping failure..." >> "$LOGFILE"
+        echo "Running diagnostics due to port mapping failure..." | tee -a "$LOGFILE"
         run_diagnostics
     else
         echo "VPN port mapped successfully: $MAPPED_PORT to $LISTENING_PORT" | tee -a "$LOGFILE"
@@ -219,6 +217,16 @@ while true; do
             echo "UDP mapping successful (TCP may have failed)" >> "$LOGFILE"
         else
             echo "TCP mapping successful (UDP may have failed)" >> "$LOGFILE"
+        fi
+        
+        # Run diagnostics after first successful mapping, then every 10 cycles
+        if [ "$FIRST_SUCCESS_DIAGNOSTICS_RUN" = false ]; then
+            echo "Running diagnostics after first successful port mapping..." | tee -a "$LOGFILE"
+            run_diagnostics
+            FIRST_SUCCESS_DIAGNOSTICS_RUN=true
+        elif (( CYCLE_COUNT % 10 == 0 )); then  # Run diagnostics every 10 cycles
+            echo "Running periodic diagnostics (cycle $CYCLE_COUNT)..." | tee -a "$LOGFILE"
+            run_diagnostics
         fi
     fi
     echo "" >> "$LOGFILE"
