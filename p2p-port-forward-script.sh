@@ -11,6 +11,104 @@ INTERVAL=45 # script loop frequency, in seconds
 # Create log directory and file
 mkdir -p "$(dirname "$LOGFILE")"
 
+# Function to run diagnostics
+run_diagnostics() {
+    local current_public_ip=""
+    local current_mapped_port=""
+    
+    echo "=== DIAGNOSTIC INFORMATION ===" | tee -a "$LOGFILE"
+    
+    # Get current public IP and mapped port from natpmpc
+    echo "Getting current VPN public IP and port mapping..." | tee -a "$LOGFILE"
+    local natpmpc_output
+    if natpmpc_output=$(docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" udp 3600 -g "$WGTUNNEL" 2>&1); then
+        current_public_ip=$(echo "$natpmpc_output" | grep -oP 'Public IP address : \K[0-9.]+' | tail -n1)
+        current_mapped_port=$(echo "$natpmpc_output" | grep -oP 'Mapped public port \K[0-9]+' | tail -n1)
+        echo "✓ Public IP: $current_public_ip, Mapped Port: $current_mapped_port" | tee -a "$LOGFILE"
+    else
+        echo "✗ Failed to get current public IP and port mapping" | tee -a "$LOGFILE"
+    fi
+    echo "" | tee -a "$LOGFILE"
+    
+    # Check container network configuration
+    echo "Container network info:" | tee -a "$LOGFILE"
+    docker exec "$CONTAINER" ip addr show 2>/dev/null | tee -a "$LOGFILE" || echo "Failed to get container IP info" | tee -a "$LOGFILE"
+    echo "" | tee -a "$LOGFILE"
+    
+    # Test connectivity to WireGuard gateway
+    echo "Testing connectivity to WireGuard gateway ($WGTUNNEL):" | tee -a "$LOGFILE"
+    if docker exec "$CONTAINER" ping -c 3 "$WGTUNNEL" 2>&1 | tee -a "$LOGFILE" >/dev/null; then
+        echo "✓ WireGuard gateway is reachable" | tee -a "$LOGFILE"
+    else
+        echo "✗ WireGuard gateway is NOT reachable" | tee -a "$LOGFILE"
+    fi
+    echo "" | tee -a "$LOGFILE"
+    
+    # Test external connectivity
+    echo "Testing external connectivity:" | tee -a "$LOGFILE"
+    if docker exec "$CONTAINER" nslookup google.com 2>&1 | tee -a "$LOGFILE" >/dev/null; then
+        echo "✓ External DNS resolution works" | tee -a "$LOGFILE"
+    else
+        echo "✗ External DNS resolution failed" | tee -a "$LOGFILE"
+    fi
+    echo "" | tee -a "$LOGFILE"
+    
+    # Test external port connectivity (if we have current mapping info)
+    if [[ -n "$current_public_ip" && -n "$current_mapped_port" ]]; then
+        echo "Testing external port connectivity ($current_public_ip:$current_mapped_port):" | tee -a "$LOGFILE"
+        # Try to test the port from within the container using timeout and nc/telnet
+        if docker exec "$CONTAINER" sh -c "command -v nc >/dev/null 2>&1"; then
+            # Use netcat to test external connectivity
+            if timeout 10 docker exec "$CONTAINER" sh -c "echo '' | nc -w 5 $current_public_ip $current_mapped_port" 2>/dev/null; then
+                echo "✓ External port $current_public_ip:$current_mapped_port is reachable" | tee -a "$LOGFILE"
+            else
+                echo "✗ External port $current_public_ip:$current_mapped_port is NOT reachable from container" | tee -a "$LOGFILE"
+                echo "  This suggests the VPN provider's port forwarding may not be working properly" | tee -a "$LOGFILE"
+            fi
+        else
+            # Try with curl as an alternative
+            if docker exec "$CONTAINER" sh -c "command -v curl >/dev/null 2>&1"; then
+                if timeout 10 docker exec "$CONTAINER" curl -m 5 --connect-timeout 5 "telnet://$current_public_ip:$current_mapped_port" 2>&1 | grep -q "Connected"; then
+                    echo "✓ External port $current_public_ip:$current_mapped_port is reachable" | tee -a "$LOGFILE"
+                else
+                    echo "✗ External port $current_public_ip:$current_mapped_port is NOT reachable from container" | tee -a "$LOGFILE"
+                    echo "  This suggests the VPN provider's port forwarding may not be working properly" | tee -a "$LOGFILE"
+                fi
+            else
+                echo "⚠ Cannot test external port connectivity (nc/curl not available in container)" | tee -a "$LOGFILE"
+                echo "  Consider installing netcat-openbsd or curl in your container for better diagnostics" | tee -a "$LOGFILE"
+            fi
+        fi
+    else
+        echo "⚠ Cannot test external port connectivity (no current mapping info available)" | tee -a "$LOGFILE"
+    fi
+    echo "" | tee -a "$LOGFILE"
+    
+    # Check if qBittorrent is listening on the configured port
+    echo "Checking if qBittorrent is listening on port $LISTENING_PORT:" | tee -a "$LOGFILE"
+    if docker exec "$CONTAINER" netstat -ln 2>/dev/null | grep ":$LISTENING_PORT " | tee -a "$LOGFILE" >/dev/null; then
+        echo "✓ qBittorrent is listening on port $LISTENING_PORT" | tee -a "$LOGFILE"
+    else
+        echo "✗ qBittorrent is NOT listening on port $LISTENING_PORT" | tee -a "$LOGFILE"
+        echo "Available listening ports in container:" | tee -a "$LOGFILE"
+        docker exec "$CONTAINER" netstat -ln 2>/dev/null | grep LISTEN | tee -a "$LOGFILE" || echo "netstat not available" | tee -a "$LOGFILE"
+    fi
+    echo "" | tee -a "$LOGFILE"
+    
+    # ProtonVPN specific recommendations
+    if [[ -n "$current_public_ip" && -n "$current_mapped_port" ]]; then
+        echo "ProtonVPN troubleshooting recommendations:" | tee -a "$LOGFILE"
+        echo "1. Verify you're connected to a P2P-enabled ProtonVPN server" | tee -a "$LOGFILE"
+        echo "2. Test external connectivity using: Test-NetConnection -ComputerName $current_public_ip -Port $current_mapped_port" | tee -a "$LOGFILE"
+        echo "3. Some ProtonVPN P2P servers may have port forwarding limitations" | tee -a "$LOGFILE"
+        echo "4. Try connecting to a different ProtonVPN P2P server if external connectivity fails" | tee -a "$LOGFILE"
+        echo "" | tee -a "$LOGFILE"
+    fi
+    
+    echo "=== END DIAGNOSTICS ===" | tee -a "$LOGFILE"
+    echo "" | tee -a "$LOGFILE"
+}
+
 # Wait for container to initialize
 sleep 60
 
@@ -20,11 +118,40 @@ if ! docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q t
     exit 1
 fi
 
-# Check/install libnatpmp once before loop
-if ! docker exec "$CONTAINER" which natpmpc &>/dev/null; then
-    echo "natpmpc not found, installing in container '$CONTAINER'..." | tee -a "$LOGFILE"
-    docker exec "$CONTAINER" apk update
-    docker exec "$CONTAINER" apk add --no-cache libnatpmp
+# Function to ensure libnatpmp is installed
+ensure_libnatpmp_installed() {
+    local max_retries=3
+    local retry_count=0
+    
+    while [ $retry_count -lt $max_retries ]; do
+        if docker exec "$CONTAINER" which natpmpc &>/dev/null; then
+            echo "natpmpc is available in container '$CONTAINER'" | tee -a "$LOGFILE"
+            return 0
+        fi
+        
+        retry_count=$((retry_count + 1))
+        echo "natpmpc not found, installing in container '$CONTAINER' (attempt $retry_count/$max_retries)..." | tee -a "$LOGFILE"
+        
+        if docker exec "$CONTAINER" apk update && docker exec "$CONTAINER" apk add --no-cache libnatpmp; then
+            echo "Successfully installed libnatpmp in container '$CONTAINER'" | tee -a "$LOGFILE"
+            return 0
+        else
+            echo "Failed to install libnatpmp (attempt $retry_count/$max_retries)" | tee -a "$LOGFILE"
+            if [ $retry_count -lt $max_retries ]; then
+                echo "Retrying in 10 seconds..." | tee -a "$LOGFILE"
+                sleep 10
+            fi
+        fi
+    done
+    
+    echo "ERROR: Failed to install libnatpmp after $max_retries attempts" | tee -a "$LOGFILE"
+    return 1
+}
+
+# Initial libnatpmp installation check
+if ! ensure_libnatpmp_installed; then
+    echo "Cannot proceed without libnatpmp. Exiting." | tee -a "$LOGFILE"
+    exit 1
 fi
 
 while true; do
@@ -48,28 +175,117 @@ while true; do
         continue
     fi
 
-    # Run natpmpc for TCP
-    TCP_OUTPUT=$(docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" tcp 1200 -g "$WGTUNNEL" 2>&1)
-    echo "TCP Mapping Output:" >> "$LOGFILE"
-    echo "$TCP_OUTPUT" >> "$LOGFILE"
-    echo "" >> "$LOGFILE"
+    # Ensure libnatpmp is still installed (in case container was restarted)
+    if ! docker exec "$CONTAINER" which natpmpc &>/dev/null; then
+        echo "natpmpc no longer available, reinstalling..." | tee -a "$LOGFILE"
+        if ! ensure_libnatpmp_installed; then
+            echo "Failed to reinstall libnatpmp, skipping this cycle" | tee -a "$LOGFILE"
+            sleep "$INTERVAL"
+            continue
+        fi
+    fi
 
-    # Run natpmpc for UDP
-    UDP_OUTPUT=$(docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" udp 1200 -g "$WGTUNNEL" 2>&1)
-    echo "UDP Mapping Output:" >> "$LOGFILE"
-    echo "$UDP_OUTPUT" >> "$LOGFILE"
-    echo "" >> "$LOGFILE"
+    # Initialize diagnostic tracking variables
+    CYCLE_COUNT=${CYCLE_COUNT:-0}
+    FIRST_SUCCESS_DIAGNOSTICS_RUN=${FIRST_SUCCESS_DIAGNOSTICS_RUN:-false}
+    CYCLE_COUNT=$((CYCLE_COUNT + 1))
 
-    # Extract mapped port
-    MAPPED_PORT=$(echo "$UDP_OUTPUT" | grep -oP 'Mapped public port \K[0-9]+' | tail -n1)
+    # Function to run natpmpc with retry logic
+    run_natpmpc_with_retry() {
+        local protocol=$1
+        local max_retries=3
+        local retry_count=0
+        
+        while [ $retry_count -lt $max_retries ]; do
+            echo "Running natpmpc for $protocol (attempt $((retry_count + 1))/$max_retries)..." >> "$LOGFILE"
+            
+            local output
+            output=$(docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" "$protocol" 3600 -g "$WGTUNNEL" 2>&1)
+            local exit_code=$?
+            
+            echo "$protocol Mapping Output:" >> "$LOGFILE"
+            echo "$output" >> "$LOGFILE"
+            echo "" >> "$LOGFILE"
+            
+            # Check for common error patterns
+            if echo "$output" | grep -q "sendto.*: Network is unreachable"; then
+                echo "Network unreachable error detected for $protocol" >> "$LOGFILE"
+                retry_count=$((retry_count + 1))
+                if [ $retry_count -lt $max_retries ]; then
+                    echo "Retrying in 5 seconds..." >> "$LOGFILE"
+                    sleep 5
+                    continue
+                fi
+            elif echo "$output" | grep -q "Mapped public port"; then
+                echo "Successfully mapped $protocol port" >> "$LOGFILE"
+                echo "$output"
+                return 0
+            elif [ $exit_code -ne 0 ]; then
+                echo "natpmpc failed with exit code $exit_code for $protocol" >> "$LOGFILE"
+                retry_count=$((retry_count + 1))
+                if [ $retry_count -lt $max_retries ]; then
+                    echo "Retrying in 5 seconds..." >> "$LOGFILE"
+                    sleep 5
+                    continue
+                fi
+            else
+                echo "$output"
+                return 0
+            fi
+        done
+        
+        echo "Failed to map $protocol port after $max_retries attempts" >> "$LOGFILE"
+        return 1
+    }
+
+    # Run natpmpc for TCP and UDP with retry logic
+    TCP_SUCCESS=false
+    UDP_SUCCESS=false
+    
+    if TCP_OUTPUT=$(run_natpmpc_with_retry tcp); then
+        TCP_SUCCESS=true
+    fi
+    
+    if UDP_OUTPUT=$(run_natpmpc_with_retry udp); then
+        UDP_SUCCESS=true
+    fi
+
+    # Extract mapped port (prioritize UDP, fallback to TCP)
+    MAPPED_PORT=""
+    if [ "$UDP_SUCCESS" = true ]; then
+        MAPPED_PORT=$(echo "$UDP_OUTPUT" | grep -oP 'Mapped public port \K[0-9]+' | tail -n1)
+    elif [ "$TCP_SUCCESS" = true ]; then
+        MAPPED_PORT=$(echo "$TCP_OUTPUT" | grep -oP 'Mapped public port \K[0-9]+' | tail -n1)
+    fi
 
     if [[ -z "$MAPPED_PORT" || ! "$MAPPED_PORT" =~ ^[0-9]+$ ]]; then
         echo "Failed to map port or retrieve mapped port. Check natpmpc output above." | tee -a "$LOGFILE"
-        echo "" >> "$LOGFILE"
+        echo "TCP Success: $TCP_SUCCESS, UDP Success: $UDP_SUCCESS" >> "$LOGFILE"
+        
+        # Run diagnostics on failure to help troubleshooting
+        echo "Running diagnostics due to port mapping failure..." | tee -a "$LOGFILE"
+        run_diagnostics
     else
         echo "VPN port mapped successfully: $MAPPED_PORT to $LISTENING_PORT" | tee -a "$LOGFILE"
-        echo "" >> "$LOGFILE"
+        if [ "$TCP_SUCCESS" = true ] && [ "$UDP_SUCCESS" = true ]; then
+            echo "Both TCP and UDP mapping successful" >> "$LOGFILE"
+        elif [ "$UDP_SUCCESS" = true ]; then
+            echo "UDP mapping successful (TCP may have failed)" >> "$LOGFILE"
+        else
+            echo "TCP mapping successful (UDP may have failed)" >> "$LOGFILE"
+        fi
+        
+        # Run diagnostics after first successful mapping, then every 10 cycles
+        if [ "$FIRST_SUCCESS_DIAGNOSTICS_RUN" = false ]; then
+            echo "Running diagnostics after first successful port mapping..." | tee -a "$LOGFILE"
+            run_diagnostics
+            FIRST_SUCCESS_DIAGNOSTICS_RUN=true
+        elif (( CYCLE_COUNT % 10 == 0 )); then  # Run diagnostics every 10 cycles
+            echo "Running periodic diagnostics (cycle $CYCLE_COUNT)..." | tee -a "$LOGFILE"
+            run_diagnostics
+        fi
     fi
+    echo "" >> "$LOGFILE"
 
     sleep "$INTERVAL"
 done
