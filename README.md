@@ -56,7 +56,7 @@ Tested with ProtonVPN and `linuxserver/qbittorrent`, but should work with other 
 
 1. Install the **User Scripts** plugin from the unRAID Community Applications page (if not already installed).
 2. Go to **Plugins > User Scripts**.
-3. Add a new script (e.g., `vpn_torrent_forwarding`).
+3. Add a new script (e.g., `p2p-port-forward`).
 4. Paste in the contents of **p2p-port-forward-script.sh**
 5. Modify these variables at the top of the script to match your setup:
 
