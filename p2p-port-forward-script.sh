@@ -2,7 +2,7 @@
 
 # ============================================================================
 # P2P Port Forward Script for unRAID + Wireguard VPN
-# Alpine Linux Containers Only
+# Alpine Linux Optimized (works with any container that has natpmpc)
 # ============================================================================
 #
 # DESCRIPTION:
@@ -10,22 +10,22 @@
 #   in Docker containers on unRAID, tunneled through Wireguard VPN.
 #   Solves the dynamic port problem with commercial VPNs.
 #
-# ALPINE LINUX REQUIREMENT:
-#   This script is designed ONLY for Alpine Linux-based containers.
-#   It uses the 'apk' package manager to install libnatpmp if needed.
+# OPERATING SYSTEM COMPATIBILITY:
+#   This script is OPTIMIZED for Alpine Linux containers but will work
+#   with any container that has natpmpc available or can be installed.
 #
-# COMPATIBLE CONTAINERS:
-#   ✅ linuxserver/qbittorrent (Alpine-based)
-#   ✅ hotio/qbittorrent (Alpine-based)
-#   ✅ Any other Alpine Linux torrent container
+#   ALPINE LINUX (Preferred - auto-installs if needed):
+#     ✅ linuxserver/qbittorrent
+#     ✅ hotio/qbittorrent
+#     ✅ Any Alpine-based torrent container
 #
-# INCOMPATIBLE CONTAINERS:
-#   ❌ Ubuntu/Debian-based containers (use apt, not apk)
-#   ❌ Fedora/RHEL-based containers (use dnf/yum, not apk)
+#   OTHER LINUX DISTRIBUTIONS (if natpmpc pre-installed):
+#     ⚠️  Will work IF natpmpc is already available
+#     ❌ Cannot auto-install on non-Alpine systems
 #
-# TO CHECK YOUR CONTAINER OS:
+# TO CHECK YOUR CONTAINER:
 #   docker exec CONTAINER cat /etc/os-release
-#   Look for: NAME="Alpine Linux"
+#   docker exec CONTAINER which natpmpc
 #
 # ============================================================================
 # unRAID USERSCRIPTS PLUGIN SETUP INSTRUCTIONS
@@ -104,12 +104,12 @@
 #     - Docker starts after array is online
 #     - If using "At Startup", add sleep 60 to config
 #
-# PROBLEM: "apk package manager not found"
+# PROBLEM: "natpmpc not found and cannot be installed"
 #   SOLUTION:
-#     - Your container is NOT Alpine Linux
-#     - Check: docker exec CONTAINER cat /etc/os-release
-#     - This script ONLY works with Alpine-based containers
-#     - Use linuxserver or hotio containers instead
+#     - Your container is not Alpine Linux-based
+#     - natpmpc is not pre-installed in your container
+#     - Switch to an Alpine-based container (linuxserver or hotio)
+#     - Or manually install natpmpc in your container image
 #
 # PROBLEM: "Failed to map port"
 #   SOLUTION:
@@ -352,31 +352,21 @@ fi
 log "Container '$CONTAINER' is running"
 
 # ============================================================================
-# ALPINE LINUX VERIFICATION
+# DETECT OPERATING SYSTEM AND VERIFY/INSTALL natpmpc
 # ============================================================================
 
-log "Verifying container is Alpine Linux..."
+log "Detecting container operating system..."
 
-# This script requires Alpine Linux (apk package manager)
-# Fail fast if container uses a different OS
-if ! timeout 30 docker exec "$CONTAINER" which apk &>/dev/null; then
-    log "ERROR: Alpine Linux (apk) not found in container '$CONTAINER'"
-    log ""
-    log "This script is designed ONLY for Alpine Linux-based containers."
-    log ""
-    log "To verify your container OS, run:"
-    log "  docker exec $CONTAINER cat /etc/os-release"
-    log ""
-    log "Compatible containers:"
-    log "  ✅ linuxserver/qbittorrent (Alpine-based)"
-    log "  ✅ hotio/qbittorrent (Alpine-based)"
-    log ""
-    log "If your container uses Ubuntu/Debian (apt) or Fedora (dnf),"
-    log "this script will not work. Use an Alpine-based container instead."
-    exit 1
+# Check if container has Alpine Linux (apk package manager)
+# Don't fail if it's not Alpine - we'll check for natpmpc next
+HAS_APK=false
+if timeout 30 docker exec "$CONTAINER" which apk &>/dev/null; then
+    HAS_APK=true
+    log "Detected: Alpine Linux (apk package manager available)"
+else
+    log "Note: Not Alpine Linux (apk not available)"
+    log "Will check if natpmpc is pre-installed..."
 fi
-
-log "Confirmed: Container uses Alpine Linux (apk package manager)"
 
 # ============================================================================
 # INSTALL OR VERIFY natpmpc
@@ -384,12 +374,24 @@ log "Confirmed: Container uses Alpine Linux (apk package manager)"
 
 log "Checking for natpmpc..."
 
+# Check if natpmpc is already available
 # which natpmpc: returns 0 if found, 1 if not found
 # &>/dev/null: suppress all output
-if ! timeout 30 docker exec "$CONTAINER" which natpmpc &>/dev/null; then
-    # natpmpc not found - need to install it
-    # This happens with linuxserver containers (minimal base)
-    log "natpmpc not found, installing libnatpmp package..."
+if timeout 30 docker exec "$CONTAINER" which natpmpc &>/dev/null; then
+    # natpmpc is already installed - we can proceed
+    log "✓ natpmpc is available"
+    
+    # Try to get version info for troubleshooting (works on Alpine)
+    if [[ "$HAS_APK" == "true" ]]; then
+        if NATPMP_VERSION=$(timeout 10 docker exec "$CONTAINER" apk info libnatpmp 2>/dev/null | grep -E '^libnatpmp-' | head -n1); then
+            log "Installed: $NATPMP_VERSION"
+        fi
+    fi
+    
+elif [[ "$HAS_APK" == "true" ]]; then
+    # natpmpc not found, but we have apk so we can install it
+    log "natpmpc not found, but Alpine Linux detected - can install"
+    log "Installing libnatpmp package..."
     
     # Update Alpine package index first
     # This refreshes the list of available packages
@@ -404,7 +406,7 @@ if ! timeout 30 docker exec "$CONTAINER" which natpmpc &>/dev/null; then
     # --no-cache: don't cache the package index locally (saves space)
     log "Installing libnatpmp..."
     if timeout 300 docker exec "$CONTAINER" apk add --no-cache libnatpmp 2>&1 | tee -a "$LOGFILE"; then
-        log "libnatpmp installed successfully"
+        log "✓ libnatpmp installed successfully"
     else
         log "ERROR: Failed to install libnatpmp"
         log "Check that Alpine package repositories are accessible from container"
@@ -418,18 +420,24 @@ if ! timeout 30 docker exec "$CONTAINER" which natpmpc &>/dev/null; then
         exit 1
     fi
     
-    log "natpmpc is now available"
-else
-    # natpmpc already exists
-    # This happens with hotio containers (pre-installed) or
-    # if libnatpmp was previously installed on linuxserver
-    log "natpmpc is already installed"
+    log "✓ natpmpc is now available"
     
-    # Log package version for troubleshooting
-    # apk info shows information about installed packages
-    if NATPMP_VERSION=$(timeout 10 docker exec "$CONTAINER" apk info libnatpmp 2>/dev/null | grep -E '^libnatpmp-' | head -n1); then
-        log "Installed: $NATPMP_VERSION"
-    fi
+else
+    # natpmpc not found AND we can't install it (not Alpine)
+    log "ERROR: natpmpc not found and cannot be installed"
+    log ""
+    log "This container is not Alpine Linux-based and does not have natpmpc pre-installed."
+    log ""
+    log "Solutions:"
+    log "  1. Use an Alpine-based container:"
+    log "     - linuxserver/qbittorrent (recommended)"
+    log "     - hotio/qbittorrent (has natpmpc pre-installed)"
+    log ""
+    log "  2. Or manually install libnatpmp in your current container image"
+    log ""
+    log "To check your container OS:"
+    log "  docker exec $CONTAINER cat /etc/os-release"
+    exit 1
 fi
 
 # ============================================================================
