@@ -1,52 +1,239 @@
 #!/bin/bash
 
-# Exit on error, exit on undefined variables, exit on pipe failures
-# This prevents the script from continuing if any command fails unexpectedly
-set -euo pipefail
+# ============================================================================
+# P2P Port Forward Script for unRAID + Wireguard VPN
+# ============================================================================
+#
+# DESCRIPTION:
+#   Automatically manages NAT-PMP port forwarding for torrent clients running
+#   in Docker containers on unRAID, tunneled through Wireguard VPN.
+#   Solves the dynamic port problem with commercial VPNs.
+#
+# ============================================================================
+# unRAID USERSCRIPTS PLUGIN SETUP INSTRUCTIONS
+# ============================================================================
+#
+# STEP 1: Install User Scripts Plugin
+#   1. Go to unRAID WebGUI → Apps tab
+#   2. Search for "User Scripts"
+#   3. Click "Install" on the plugin by Squid
+#   4. Wait for installation to complete
+#
+# STEP 2: Create New Script
+#   1. Go to Settings → User Scripts
+#   2. Click "Add New Script" button at bottom
+#   3. Name it: "P2P Port Forward"
+#   4. Click on the gear icon next to the script name
+#   5. Click "Edit Script"
+#   6. Delete the default content
+#   7. Paste this entire script
+#   8. Click "Save Changes"
+#
+# STEP 3: Configure Variables (REQUIRED)
+#   Edit the CONFIGURATION section below to match your setup:
+#   - CONTAINER: Your torrent container name (e.g., "qbittorrent")
+#   - LISTENING_PORT: Port your torrent client listens on (e.g., 6881)
+#   - WGTUNNEL: Your Wireguard gateway IP (found in VPN Manager)
+#     * Go to Settings → VPN Manager
+#     * Look for "Local tunnel network pool" (e.g., 10.2.0.0/24)
+#     * Change the last number from .0 to .1 (e.g., 10.2.0.1)
+#
+# STEP 4: Set Schedule (RECOMMENDED)
+#   1. Click the gear icon next to your script
+#   2. Click "Schedule Disabled"
+#   3. Choose one of these options:
+#
+#   OPTION A - Run Every 15 Minutes (Recommended for 24/7 operation)
+#     * Select "Custom"
+#     * Enter: */15 * * * *
+#     * This ensures port mapping never expires (20 min lease, 15 min renewal)
+#
+#   OPTION B - Run at Array Startup (For manual array starts)
+#     * Select "At Startup of Array"
+#     * Set MAX_RENEWALS=240 (in config below) for ~3 hour runtime
+#     * Good if you start/stop array regularly
+#
+#   OPTION C - Manual Only (For testing)
+#     * Leave as "Schedule Disabled"
+#     * Run manually by clicking "Run Script" button
+#
+# STEP 5: Test the Script
+#   1. Click "Run Script" button (not "Run in Background")
+#   2. Watch the output in real-time
+#   3. Verify you see "SUCCESS: VPN port XXXXX → 6881" messages
+#   4. Check your torrent client shows the mapped port
+#
+# STEP 6: Verify in Torrent Client
+#   For qBittorrent:
+#     1. Go to Settings → Connection
+#     2. The "Port used for incoming connections" should match
+#        the mapped port shown in the script output
+#     3. Click "Test Port" to verify it's accessible
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# PROBLEM: "Container 'qbittorrent' is not running"
+#   SOLUTION: 
+#     - Check container name is exact (case-sensitive)
+#     - Run: docker ps
+#     - Copy exact name from "NAMES" column
+#
+# PROBLEM: "Docker is not available"
+#   SOLUTION:
+#     - Wait for array to fully start
+#     - Docker starts after array is online
+#     - If using "At Startup", add sleep 60 to config
+#
+# PROBLEM: "Failed to map port"
+#   SOLUTION:
+#     - Verify WGTUNNEL IP is correct (.1, not .0)
+#     - Check Wireguard VPN is connected
+#     - Ensure VPN supports NAT-PMP (some don't)
+#     - Run inside container: ping $WGTUNNEL
+#
+# PROBLEM: "natpmpc not found after installation"
+#   SOLUTION:
+#     - Container may not support apk (Alpine package manager)
+#     - Check container OS: docker exec CONTAINER cat /etc/os-release
+#     - You may need a different container image
+#
+# PROBLEM: Script runs but port keeps changing
+#   SOLUTION:
+#     - This is normal with dynamic VPNs
+#     - Script will update torrent client automatically
+#     - Run every 15 minutes to minimize port changes
+#
+# PROBLEM: "Permission denied" on log file
+#   SOLUTION:
+#     - Script will fallback to stdout (userscripts captures it)
+#     - Or change LOGFILE to /tmp/natpmp_forward.log
+#
+# ============================================================================
+# VIEW LOGS
+# ============================================================================
+#
+# Real-time (while running):
+#   - Click "Run Script" to see live output
+#
+# Historical logs:
+#   - Go to Settings → User Scripts
+#   - Click gear icon → "View Log"
+#   - Or check: /var/log/natpmp_forward.log
+#
+# ============================================================================
+# ADVANCED CONFIGURATION
+# ============================================================================
+#
+# Environment Variable Override:
+#   Instead of editing this script, you can set environment variables
+#   in the userscripts plugin:
+#
+#   1. Click gear icon → "Edit Script"
+#   2. Add at the top (before the script):
+#      export CONTAINER="transmission"
+#      export LISTENING_PORT="51413"
+#
+# Multiple Containers:
+#   Create separate scripts for each container:
+#   - "P2P Port Forward - qBittorrent"
+#   - "P2P Port Forward - Transmission"
+#   Each with different CONTAINER and LISTENING_PORT values
+#
+# Notification on Failure:
+#   Add to unRAID notification system:
+#   1. Install "Notifications" plugin
+#   2. Add to end of script:
+#      if [[ $SUCCESSFUL_RENEWALS -eq 0 ]]; then
+#        /usr/local/emhttp/webGui/scripts/notify -s "Port Forward Failed" \
+#          -d "P2P port forwarding failed for $CONTAINER"
+#      fi
+#
+# ============================================================================
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-# Using ${VAR:-default} syntax allows environment variables to override defaults
-# Example: CONTAINER=transmission ./script.sh will use "transmission" instead
+# Using ${VAR:-default} allows environment variables to override defaults
+# Example: CONTAINER=transmission ./script.sh
 
 CONTAINER="${CONTAINER:-qbittorrent}"           # Docker container name
 LISTENING_PORT="${LISTENING_PORT:-6881}"        # Port your torrent client listens on
 WGTUNNEL="${WGTUNNEL:-10.2.0.1}"                # Wireguard gateway IP (change last octet from .0 to .1)
 LOGFILE="${LOGFILE:-/var/log/natpmp_forward.log}" # Log file path (in RAM to avoid USB wear)
 LOG_RETENTION_DAY="${LOG_RETENTION_DAY:-3}"     # Days to keep logs before rotation
-INTERVAL="${INTERVAL:-45}"                       # Seconds between port mapping renewals
+
+# How many renewal attempts to make (not an infinite loop)
+# Each renewal runs natpmpc which sets a 1200 second (20 min) lease
+# Default: 5 attempts = 5 renewals over ~2.5 minutes
+# For "At Startup" schedule, set to 240 for ~3 hours of renewals
+MAX_RENEWALS="${MAX_RENEWALS:-5}"
+
+# Seconds between renewals (must be less than the 1200 second lease)
+# Default: 30 seconds between each renewal attempt
+# For "At Startup" schedule with MAX_RENEWALS=240, use 45 seconds
+RENEWAL_INTERVAL="${RENEWAL_INTERVAL:-30}"
 
 # ============================================================================
-# INPUT VALIDATION (Security)
+# SIGNAL HANDLING (Critical for userscripts plugin)
 # ============================================================================
-# These checks prevent command injection and invalid configurations
+# When userscripts tries to stop the script, it sends SIGTERM
+# We need to handle this gracefully to avoid orphaned processes
+
+SCRIPT_RUNNING=true
+
+# Trap handler for clean shutdown
+# trap 'commands' SIGNALS means: when we receive these signals, run commands
+cleanup() {
+    echo "[$(date)] Received stop signal, cleaning up..."
+    SCRIPT_RUNNING=false
+    exit 0
+}
+
+# Register signal handlers
+# SIGTERM: sent by userscripts "stop" button
+# SIGINT: sent by Ctrl+C (if run manually)
+trap cleanup SIGTERM SIGINT
+
+# ============================================================================
+# INPUT VALIDATION
+# ============================================================================
 
 # Container name: only allow alphanumeric, underscore, dash, and dot
-# The =~ operator tests if the string matches the regex pattern
-# ^[a-zA-Z0-9_.-]+$ means: start(^), one or more allowed chars, end($)
+# =~ is the regex match operator
+# || { ... } means "if validation fails, do this"
 [[ "$CONTAINER" =~ ^[a-zA-Z0-9_.-]+$ ]] || { 
     echo "ERROR: Invalid container name. Only alphanumeric, underscore, dash, and dot allowed" 
     exit 1
 }
 
-# Port validation: must be a number between 1 and 65535
-# -ge means "greater than or equal", -le means "less than or equal"
-[[ "$LISTENING_PORT" =~ ^[0-9]+$ && "$LISTENING_PORT" -ge 1 && "$LISTENING_PORT" -le 65535 ]] || { 
+# Port validation: must be number between 1-65535
+# -a is logical AND operator in [[ ]] context
+[[ "$LISTENING_PORT" =~ ^[0-9]+$ ]] && \
+[[ "$LISTENING_PORT" -ge 1 ]] && \
+[[ "$LISTENING_PORT" -le 65535 ]] || { 
     echo "ERROR: Port must be a number between 1-65535"
     exit 1
 }
 
-# IP address validation: must match IPv4 format (xxx.xxx.xxx.xxx)
-# {1,3} means "1 to 3 digits"
+# IP address format validation: xxx.xxx.xxx.xxx
 [[ "$WGTUNNEL" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || { 
-    echo "ERROR: Invalid IP address format. Expected xxx.xxx.xxx.xxx"
+    echo "ERROR: Invalid IP address format"
     exit 1
 }
 
-# Interval validation: prevent DoS (too fast) or stale mappings (too slow)
-[[ "$INTERVAL" -ge 10 && "$INTERVAL" -le 3600 ]] || { 
-    echo "ERROR: Interval must be between 10-3600 seconds (10s to 1 hour)"
+# Renewal count validation
+[[ "$MAX_RENEWALS" =~ ^[0-9]+$ ]] && [[ "$MAX_RENEWALS" -ge 1 ]] || {
+    echo "ERROR: MAX_RENEWALS must be a positive number"
+    exit 1
+}
+
+# Interval validation: reasonable range for renewals
+[[ "$RENEWAL_INTERVAL" =~ ^[0-9]+$ ]] && \
+[[ "$RENEWAL_INTERVAL" -ge 5 ]] && \
+[[ "$RENEWAL_INTERVAL" -le 600 ]] || {
+    echo "ERROR: RENEWAL_INTERVAL must be between 5-600 seconds"
     exit 1
 }
 
@@ -54,143 +241,212 @@ INTERVAL="${INTERVAL:-45}"                       # Seconds between port mapping 
 # LOG FILE SETUP
 # ============================================================================
 
-# Create log directory if it doesn't exist
-# $(dirname "$LOGFILE") extracts the directory path from the full file path
-# Example: /var/log/natpmp_forward.log → /var/log
-mkdir -p "$(dirname "$LOGFILE")"
-
-# Create log file and set secure permissions (read/write for owner only)
-# chmod 600 means: owner can read+write (6), group nothing (0), others nothing (0)
-touch "$LOGFILE" && chmod 600 "$LOGFILE"
-
-# Helper function for timestamped logging
-# $* means "all arguments passed to this function"
-# tee -a appends to both stdout (console) and the log file
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"
+# Create log directory if needed
+# $(dirname "$LOGFILE") extracts directory from full path
+mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || {
+    echo "WARNING: Could not create log directory, logging to stdout only"
+    LOGFILE="/dev/null"
 }
 
-# ============================================================================
-# CONTAINER INITIALIZATION
-# ============================================================================
-
-# Wait for container to fully start after system boot
-sleep 60
-
-# Verify container is running before proceeding
-# timeout 10: kill the command if it takes longer than 10 seconds
-# docker inspect -f '{{.State.Running}}': returns "true" if container is running
-# 2>/dev/null: suppress error messages
-# || { ... } executes if the previous command fails
-timeout 10 docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true || {
-    log "ERROR: Container '$CONTAINER' is not running"
-    exit 1
-}
-
-# ============================================================================
-# INSTALL natpmpc (NAT-PMP client tool)
-# ============================================================================
-
-# Check if natpmpc is already installed in the container
-# which natpmpc returns 0 (success) if found, non-zero if not found
-# &>/dev/null redirects both stdout and stderr to nowhere (silent)
-# ! negates the result, so we enter the if-block when natpmpc is NOT found
-if ! timeout 30 docker exec "$CONTAINER" which natpmpc &>/dev/null; then
-    log "Installing natpmpc in container '$CONTAINER'..."
-    
-    # Install natpmpc using Alpine Linux package manager (apk)
-    # sh -c '...' runs multiple commands in a single docker exec session
-    # && chains commands: second command only runs if first succeeds
-    timeout 300 docker exec "$CONTAINER" sh -c 'apk update && apk add --no-cache libnatpmp' || {
-        log "ERROR: Failed to install natpmpc"
-        exit 1
+# Create log file with secure permissions (owner read/write only)
+if [[ "$LOGFILE" != "/dev/null" ]]; then
+    touch "$LOGFILE" 2>/dev/null && chmod 600 "$LOGFILE" 2>/dev/null || {
+        echo "WARNING: Could not create/secure log file, logging to stdout only"
+        LOGFILE="/dev/null"
     }
 fi
 
-# ============================================================================
-# MAIN LOOP - Port Forwarding
-# ============================================================================
-
-while true; do
-    
-    # ========================================================================
-    # LOG ROTATION
-    # ========================================================================
-    
-    if [[ -f "$LOGFILE" ]]; then
-        # Calculate log file age in days
-        # date +%s: current time in seconds since epoch (Unix timestamp)
-        # stat -c %Y: file modification time in seconds since epoch
-        # Subtract and divide by 86400 (seconds in a day) to get age in days
-        # $(( ... )) performs arithmetic evaluation
-        FILE_AGE_DAYS=$(( ($(date +%s) - $(stat -c %Y "$LOGFILE" 2>/dev/null || echo 0)) / 86400 ))
-        
-        # (( ... )) is arithmetic comparison context
-        # If file is older than retention period, delete and recreate it
-        (( FILE_AGE_DAYS >= LOG_RETENTION_DAY )) && rm -f "$LOGFILE" && touch "$LOGFILE" && chmod 600 "$LOGFILE"
-    fi
-
-    # ========================================================================
-    # CONTAINER STATUS CHECK
-    # ========================================================================
-    
-    # Re-check container is still running (in case it crashed or was stopped)
-    if ! timeout 10 docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
-        log "Container stopped, waiting..."
-        sleep "$INTERVAL"
-        continue  # Skip to next iteration of while loop
-    fi
-
-    # ========================================================================
-    # PORT MAPPING (TCP and UDP)
-    # ========================================================================
-    
-    # Loop through both protocols to avoid code duplication
-    for PROTOCOL in tcp udp; do
-        # natpmpc command breakdown:
-        # -a 0: map all external IPs (0 = wildcard)
-        # $LISTENING_PORT: the port number we want to forward
-        # $PROTOCOL: tcp or udp
-        # 1200: lease time in seconds (how long the mapping lasts)
-        # -g $WGTUNNEL: gateway IP address
-        # 2>&1: redirect stderr to stdout so we capture all output
-        # $(...) captures the command output into the OUTPUT variable
-        # || { ... } executes if natpmpc command fails
-        OUTPUT=$(timeout 30 docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" "$PROTOCOL" 1200 -g "$WGTUNNEL" 2>&1) || {
-            log "WARNING: Failed to map $PROTOCOL port"
-            continue  # Skip to next protocol
-        }
-        # Append the full output to log file for debugging
-        echo "$OUTPUT" >> "$LOGFILE"
-    done
-
-    # ========================================================================
-    # EXTRACT MAPPED PORT NUMBER
-    # ========================================================================
-    
-    # Run natpmpc again to get the current UDP mapping
-    # grep -oP: -o shows only matching part, -P enables Perl regex
-    # 'Mapped public port \K[0-9]+': 
-    #   - Matches "Mapped public port " followed by digits
-    #   - \K discards everything before it (lookbehind)
-    #   - So only the port number is returned
-    # tail -n1: take only the last line (most recent mapping)
-    MAPPED_PORT=$(timeout 30 docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" udp 1200 -g "$WGTUNNEL" 2>&1 | grep -oP 'Mapped public port \K[0-9]+' | tail -n1)
-    
-    # Check if we successfully extracted a valid port number
-    # -n tests if string is non-empty
-    # [[ ... && ... ]] means both conditions must be true
-    if [[ -n "$MAPPED_PORT" && "$MAPPED_PORT" =~ ^[0-9]+$ ]]; then
-        log "SUCCESS: VPN port $MAPPED_PORT → $LISTENING_PORT"
+# Logging helper function
+# tee -a: append to both stdout and log file
+log() {
+    if [[ "$LOGFILE" != "/dev/null" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"
     else
-        log "WARNING: Could not determine mapped port"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
     fi
+}
 
-    # ========================================================================
-    # WAIT BEFORE NEXT RENEWAL
-    # ========================================================================
+# ============================================================================
+# LOG ROTATION
+# ============================================================================
+
+# Rotate log if older than retention period
+# Only rotate if we have a real log file
+if [[ -f "$LOGFILE" && "$LOGFILE" != "/dev/null" ]]; then
+    # Calculate file age in days
+    # date +%s = current timestamp
+    # stat -c %Y = file modification timestamp
+    # 86400 = seconds in a day
+    # $(( ... )) performs arithmetic evaluation
+    FILE_AGE_DAYS=$(( ($(date +%s) - $(stat -c %Y "$LOGFILE" 2>/dev/null || echo 0)) / 86400 ))
     
-    # Sleep for configured interval before renewing port mapping
-    # Port mappings expire after 1200 seconds, so we renew every 45s by default
-    sleep "$INTERVAL"
+    if (( FILE_AGE_DAYS >= LOG_RETENTION_DAY )); then
+        log "Rotating log file (age: $FILE_AGE_DAYS days)"
+        # Move old log instead of deleting (safer)
+        mv "$LOGFILE" "${LOGFILE}.old" 2>/dev/null
+        touch "$LOGFILE" && chmod 600 "$LOGFILE"
+    fi
+fi
+
+# ============================================================================
+# DOCKER AVAILABILITY CHECK
+# ============================================================================
+
+log "Checking Docker availability..."
+
+# During array start/stop, Docker may not be available
+# Give it time to start (important for "At Startup of Array" schedule)
+for i in {1..30}; do
+    if docker info &>/dev/null; then
+        log "Docker is available"
+        break
+    fi
+    if [[ $i -eq 30 ]]; then
+        log "ERROR: Docker is not available after 30 seconds"
+        exit 1
+    fi
+    sleep 1
 done
+
+# ============================================================================
+# CONTAINER STATUS CHECK
+# ============================================================================
+
+log "Checking container '$CONTAINER' status..."
+
+# Check if container exists and is running
+# timeout prevents hanging if Docker is unresponsive
+# 2>&1 captures both stdout and stderr
+if ! timeout 10 docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>&1 | grep -q "^true$"; then
+    log "ERROR: Container '$CONTAINER' is not running"
+    log "Available containers:"
+    docker ps --format "{{.Names}}" 2>/dev/null || log "Could not list containers"
+    exit 1
+fi
+
+log "Container '$CONTAINER' is running"
+
+# ============================================================================
+# INSTALL natpmpc IF NEEDED
+# ============================================================================
+
+log "Checking for natpmpc..."
+
+# which natpmpc: returns 0 if found, 1 if not found
+# &>/dev/null: suppress all output
+if ! timeout 30 docker exec "$CONTAINER" which natpmpc &>/dev/null; then
+    log "natpmpc not found, installing..."
+    
+    # Run installation with error handling
+    # Don't use set -e, handle errors explicitly
+    if timeout 300 docker exec "$CONTAINER" sh -c 'apk update && apk add --no-cache libnatpmp' 2>&1 | tee -a "$LOGFILE"; then
+        log "natpmpc installed successfully"
+    else
+        log "ERROR: Failed to install natpmpc"
+        exit 1
+    fi
+    
+    # Verify installation worked
+    if ! timeout 30 docker exec "$CONTAINER" which natpmpc &>/dev/null; then
+        log "ERROR: natpmpc not found after installation"
+        exit 1
+    fi
+else
+    log "natpmpc is already installed"
+fi
+
+# ============================================================================
+# PORT FORWARDING RENEWALS
+# ============================================================================
+
+log "Starting port forwarding renewals (max: $MAX_RENEWALS)"
+
+# Counter for successful renewals
+SUCCESSFUL_RENEWALS=0
+
+# Loop with a fixed number of iterations (not infinite)
+# This allows the script to finish and be re-run by userscripts scheduler
+for RENEWAL_COUNT in $(seq 1 $MAX_RENEWALS); do
+    
+    # Check if we received a stop signal
+    if [[ "$SCRIPT_RUNNING" != "true" ]]; then
+        log "Stop signal received, exiting renewal loop"
+        break
+    fi
+    
+    log "=== Renewal attempt $RENEWAL_COUNT of $MAX_RENEWALS ==="
+    
+    # Re-check container is still running
+    # During renewals, container could be stopped
+    if ! timeout 10 docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q "^true$"; then
+        log "WARNING: Container stopped during renewals, waiting..."
+        sleep "$RENEWAL_INTERVAL"
+        continue  # Skip to next iteration
+    fi
+    
+    # Renewal success flag for this iteration
+    RENEWAL_SUCCESS=true
+    
+    # Map both TCP and UDP ports
+    for PROTOCOL in tcp udp; do
+        log "Mapping $PROTOCOL port..."
+        
+        # natpmpc parameters:
+        # -a 0 = listen on all interfaces (0 = wildcard)
+        # $LISTENING_PORT = internal port number
+        # $PROTOCOL = tcp or udp
+        # 1200 = lease duration in seconds (20 minutes)
+        # -g $WGTUNNEL = gateway IP address
+        # 2>&1 = redirect stderr to stdout for capture
+        
+        if OUTPUT=$(timeout 30 docker exec "$CONTAINER" natpmpc -a 0 "$LISTENING_PORT" "$PROTOCOL" 1200 -g "$WGTUNNEL" 2>&1); then
+            # Success - log output
+            echo "$OUTPUT" >> "$LOGFILE"
+            
+            # Extract mapped port number from output
+            # grep -oP: Perl regex, -o = only matching part
+            # \K = lookbehind (discard everything before)
+            if MAPPED_PORT=$(echo "$OUTPUT" | grep -oP 'Mapped public port \K[0-9]+' | tail -n1); then
+                if [[ -n "$MAPPED_PORT" ]]; then
+                    log "SUCCESS: $PROTOCOL port $MAPPED_PORT → $LISTENING_PORT"
+                fi
+            fi
+        else
+            # Failed - log error but continue trying
+            EXIT_CODE=$?
+            log "WARNING: Failed to map $PROTOCOL port (exit code: $EXIT_CODE)"
+            if [[ $EXIT_CODE -eq 124 ]]; then
+                log "WARNING: Command timed out after 30 seconds"
+            fi
+            RENEWAL_SUCCESS=false
+        fi
+    done
+    
+    # Track successful complete renewals (both TCP and UDP succeeded)
+    if [[ "$RENEWAL_SUCCESS" == "true" ]]; then
+        ((SUCCESSFUL_RENEWALS++))
+    fi
+    
+    # Wait before next renewal (unless this is the last one)
+    if [[ $RENEWAL_COUNT -lt $MAX_RENEWALS ]]; then
+        log "Waiting $RENEWAL_INTERVAL seconds before next renewal..."
+        sleep "$RENEWAL_INTERVAL"
+    fi
+done
+
+# ============================================================================
+# COMPLETION SUMMARY
+# ============================================================================
+
+log "=== Script Complete ==="
+log "Total renewals attempted: $MAX_RENEWALS"
+log "Successful renewals: $SUCCESSFUL_RENEWALS"
+
+# Exit with appropriate code
+if [[ $SUCCESSFUL_RENEWALS -gt 0 ]]; then
+    log "At least one renewal succeeded"
+    exit 0
+else
+    log "ERROR: No successful renewals"
+    exit 1
+fi
