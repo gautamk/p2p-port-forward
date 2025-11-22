@@ -47,14 +47,13 @@
 #   7. Paste this entire script
 #   8. Click "Save Changes"
 #
-# STEP 3: Configure Variables (REQUIRED)
+# STEP 3: Configure Variables (REQUIRED - except WGTUNNEL auto-detects)
 #   Edit the CONFIGURATION section below to match your setup:
 #   - CONTAINER: Your torrent container name (e.g., "qbittorrent")
 #   - LISTENING_PORT: Port your torrent client listens on (e.g., 6881)
-#   - WGTUNNEL: Your Wireguard gateway IP (found in VPN Manager)
-#     * Go to Settings → VPN Manager
-#     * Look for "Local tunnel network pool" (e.g., 10.2.0.0/24)
-#     * Change the last number from .0 to .1 (e.g., 10.2.0.1)
+#   - WGTUNNEL: Leave empty for auto-detection (recommended)
+#     * Script will automatically detect the default gateway
+#     * Or manually set if auto-detection fails
 #
 # STEP 4: Set Schedule (RECOMMENDED)
 #   1. Click the gear icon next to your script
@@ -104,6 +103,12 @@
 #     - Docker starts after array is online
 #     - If using "At Startup", add sleep 60 to config
 #
+# PROBLEM: "Could not auto-detect gateway"
+#   SOLUTION:
+#     - Manually set WGTUNNEL in configuration
+#     - Find gateway: docker exec CONTAINER ip route | grep default
+#     - Set WGTUNNEL to the IP after "via"
+#
 # PROBLEM: "natpmpc not found and cannot be installed"
 #   SOLUTION:
 #     - Your container is not Alpine Linux-based
@@ -113,16 +118,16 @@
 #
 # PROBLEM: "Failed to map port"
 #   SOLUTION:
-#     - Verify WGTUNNEL IP is correct (.1, not .0)
-#     - Check Wireguard VPN is connected
+#     - Verify VPN is connected inside container
+#     - Check Wireguard VPN is running
 #     - Ensure VPN supports NAT-PMP (some don't)
-#     - Test: docker exec CONTAINER ping -c 1 10.2.0.1
+#     - Test: docker exec CONTAINER ping -c 1 <gateway>
 #
-# PROBLEM: "natpmpc not found after installation"
+# PROBLEM: "Gateway is not responding to ping"
 #   SOLUTION:
-#     - Installation may have failed
-#     - Check container has internet access
-#     - Try manually: docker exec CONTAINER apk add libnatpmp
+#     - This is sometimes normal (gateway may block ICMP)
+#     - Script will still attempt NAT-PMP even if ping fails
+#     - If NAT-PMP fails, check VPN provider supports it
 #
 # PROBLEM: Script runs but port keeps changing
 #   SOLUTION:
@@ -185,7 +190,7 @@
 
 CONTAINER="${CONTAINER:-qbittorrent}"           # Docker container name
 LISTENING_PORT="${LISTENING_PORT:-6881}"        # Port your torrent client listens on
-WGTUNNEL="${WGTUNNEL:-10.2.0.1}"                # Wireguard gateway IP (change last octet from .0 to .1)
+WGTUNNEL="${WGTUNNEL:-}"                        # Gateway IP - leave empty for auto-detection
 LOGFILE="${LOGFILE:-/var/log/natpmp_forward.log}" # Log file path (in RAM to avoid USB wear)
 LOG_RETENTION_DAY="${LOG_RETENTION_DAY:-3}"     # Days to keep logs before rotation
 
@@ -242,11 +247,15 @@ trap cleanup SIGTERM SIGINT
     exit 1
 }
 
-# IP address format validation: xxx.xxx.xxx.xxx
-[[ "$WGTUNNEL" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || { 
-    echo "ERROR: Invalid IP address format"
-    exit 1
-}
+# Gateway IP validation - only if manually set (not empty)
+# If empty, we'll auto-detect it later
+if [[ -n "$WGTUNNEL" ]]; then
+    # IP address format validation: xxx.xxx.xxx.xxx
+    [[ "$WGTUNNEL" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || { 
+        echo "ERROR: Invalid IP address format for WGTUNNEL"
+        exit 1
+    }
+fi
 
 # Renewal count validation
 [[ "$MAX_RENEWALS" =~ ^[0-9]+$ ]] && [[ "$MAX_RENEWALS" -ge 1 ]] || {
@@ -352,6 +361,55 @@ fi
 log "Container '$CONTAINER' is running"
 
 # ============================================================================
+# AUTO-DETECT GATEWAY (if not manually configured)
+# ============================================================================
+
+if [[ -z "$WGTUNNEL" ]]; then
+    log "Gateway not configured, attempting auto-detection..."
+    
+    # Get the default gateway from the container's routing table
+    # "ip route" shows routing table
+    # "grep default" finds the default route line
+    # "awk '{print $3}'" extracts the 3rd field (gateway IP)
+    # Example line: "default via 172.31.200.1 dev eth0"
+    #                      ↑ this is field 3
+    if DETECTED_GATEWAY=$(timeout 10 docker exec "$CONTAINER" ip route 2>/dev/null | grep '^default' | awk '{print $3}' | head -n1); then
+        # Validate that we got an IP address
+        if [[ "$DETECTED_GATEWAY" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            WGTUNNEL="$DETECTED_GATEWAY"
+            log "✓ Auto-detected gateway: $WGTUNNEL"
+        else
+            log "ERROR: Auto-detected gateway is not a valid IP: '$DETECTED_GATEWAY'"
+            log "Please manually set WGTUNNEL in the configuration"
+            exit 1
+        fi
+    else
+        log "ERROR: Could not auto-detect gateway"
+        log "Please manually set WGTUNNEL in the configuration"
+        log "To find gateway, run: docker exec $CONTAINER ip route | grep default"
+        exit 1
+    fi
+else
+    log "Using manually configured gateway: $WGTUNNEL"
+fi
+
+# ============================================================================
+# TEST GATEWAY CONNECTIVITY (optional - informational only)
+# ============================================================================
+
+log "Testing gateway connectivity..."
+
+# Try to ping the gateway (not critical if it fails - some gateways block ICMP)
+# -c 2: send 2 ping packets
+# -W 2: wait max 2 seconds for response
+if timeout 5 docker exec "$CONTAINER" ping -c 2 -W 2 "$WGTUNNEL" &>/dev/null; then
+    log "✓ Gateway $WGTUNNEL is responding to ping"
+else
+    log "⚠ Gateway $WGTUNNEL is not responding to ping (may be normal if ICMP is blocked)"
+    log "Will attempt NAT-PMP anyway..."
+fi
+
+# ============================================================================
 # DETECT OPERATING SYSTEM AND VERIFY/INSTALL natpmpc
 # ============================================================================
 
@@ -445,6 +503,7 @@ fi
 # ============================================================================
 
 log "Starting port forwarding renewals (max: $MAX_RENEWALS)"
+log "Using gateway: $WGTUNNEL"
 
 # Counter for successful renewals
 SUCCESSFUL_RENEWALS=0
